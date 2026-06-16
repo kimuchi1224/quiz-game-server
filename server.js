@@ -146,12 +146,11 @@ io.on('connection', (socket) => {
     // 早押しボタン
     socket.on('buzz', () => {
         if (roomState.status !== 'QUIZ_TEXT') return;
-        // すでにこのラウンドで誤答しているプレイヤーはスルー
         if (roomState.wrongPlayersInRound.includes(socket.id)) return;
 
-        // 流れている文字送り、または猶予タイマーを止める
+        // 文字送りタイマー、およびシンキングタイマー（毎秒のやつ）を完全に止める
         clearInterval(roomState.textTimer);
-        clearTimeout(roomState.thinkingTimer);
+        clearInterval(roomState.thinkingTimer); 
 
         roomState.status = 'QUIZ_ANSWER';
         roomState.activePlayerId = socket.id;
@@ -219,7 +218,8 @@ io.on('connection', (socket) => {
             answeredPlayer: roomState.activePlayerId ? roomState.players[roomState.activePlayerId].name : "なし",
             answerText: answerText,
             correctAnswer: quiz.answers[0],
-            explanation: quiz.explanation
+            explanation: quiz.explanation,
+            fullQuestion: quiz.question // ★追加：問題の全文を送信
         });
         io.emit('room-update', roomState);
     }
@@ -229,16 +229,15 @@ io.on('connection', (socket) => {
         roomState.status = 'QUIZ_TEXT';
         roomState.activePlayerId = null;
         io.emit('room-update', roomState);
-        
-        // 残りの問題文があれば文字送りを再開、なければ猶予タイマーを再開
+    
         const quiz = roomState.quizzes[roomState.currentQuizIndex];
         if (roomState.displayedTextLength < quiz.question.length) {
             runTextTimer(quiz);
         } else {
-            startThinkingTimer(quiz);
+            startThinkingTimer(quiz); // 再開時もカウントダウンを回す
         }
     }
-
+    
     // 確認ボタンが押されたとき
     socket.on('confirm-next', () => {
         if (roomState.status !== 'QUIZ_RESULT') return;
@@ -320,19 +319,33 @@ function runTextTimer(quiz) {
 
 // 読み上げ後の猶予時間（シンキングタイム）タイマー
 function startThinkingTimer(quiz) {
-    roomState.thinkingTimer = setTimeout(() => {
-        // 猶予時間内に誰も押さなかったら結果画面へ一変
-        roomState.status = 'QUIZ_RESULT';
-        roomState.confirmedPlayers = {};
-        io.emit('quiz-round-result', {
-            isCorrect: false,
-            answeredPlayer: "なし",
-            answerText: "(タイムアップ)",
-            correctAnswer: quiz.answers[0],
-            explanation: quiz.explanation
-        });
-        io.emit('room-update', roomState);
-    }, roomState.config.thinkingLimit * 1000);
-}
+    let thinkingCountdown = roomState.config.thinkingLimit;
+    
+    // 最初の一秒目を即座に通知
+    io.emit('thinking-timer', thinkingCountdown);
 
+    // 1秒ごとにカウントダウンを刻む
+    roomState.thinkingTimer = setInterval(() => {
+        thinkingCountdown--;
+        io.emit('thinking-timer', thinkingCountdown);
+
+        if (thinkingCountdown <= 0) {
+            clearInterval(roomState.thinkingTimer); // インターバルタイマーをクリア
+            
+            // 誰もおさずにタイムアップ
+            roomState.status = 'QUIZ_RESULT';
+            roomState.confirmedPlayers = {};
+            
+            io.emit('quiz-round-result', {
+                isCorrect: false,
+                answeredPlayer: "なし",
+                answerText: "(タイムアップ)",
+                correctAnswer: quiz.answers[0],
+                explanation: quiz.explanation,
+                fullQuestion: quiz.question // ★追加：問題の全文を送信
+            });
+            io.emit('room-update', roomState);
+        }
+    }, 1000);
+}
 server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
