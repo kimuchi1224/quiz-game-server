@@ -27,6 +27,7 @@ const DEFAULT_QUIZZES = [
 
 let roomState = {
     status: 'LOBBY',
+    hostId: null, // ★追加：現在誰がホスト（室長）なのかのSocketIDを保持
     config: { 
         genre: '一般', 
         difficulty: '中級', 
@@ -96,20 +97,44 @@ function checkAnswer(input, validAnswers) {
 
 io.on('connection', (socket) => {
     const nickname = socket.handshake.query.name || `ゲスト_${socket.id.slice(0,4)}`;
-    roomState.players[socket.id] = { id: socket.id, name: nickname, currentScore: 0, totalScore: 0 };
+    
+    // 1. プレイヤーを登録する前に、部屋が空（＝自分が最初の1人目）か確認
+    const isFirstPlayer = Object.keys(roomState.players).length === 0;
+
+    roomState.players[socket.id] = { 
+        id: socket.id, 
+        name: nickname, 
+        currentScore: 0, 
+        totalScore: 0 
+    };
+
+    // 2. 最初の1人目なら、その人をホストに指名
+    if (isFirstPlayer) {
+        roomState.hostId = socket.id;
+        console.log(`初代ホストが決定しました: ${nickname}`);
+    }
+
     io.emit('room-update', roomState);
 
-    // 設定変更
+    // 3. 【権限チェック】設定変更
     socket.on('set-config', (config) => {
         if (roomState.status !== 'LOBBY') return;
+        // 送信者がホストではない場合は拒否
+        if (socket.id !== roomState.hostId) {
+            socket.emit('config-saved', 'エラー：設定を変更できるのはホストだけです。');
+            return;
+        }
         roomState.config = config;
-        socket.emit('config-saved', '設定を保存しました！'); // 送信元だけに通知
+        socket.emit('config-saved', '設定を保存しました！');
         io.emit('room-update', roomState);
     });
 
-    // ゲーム開始前の待機状態通知
+    // 4. 【権限チェック】ゲーム開始
     socket.on('game-start', async () => {
         if (roomState.status !== 'LOBBY') return;
+        // 送信者がホストではない場合は無視
+        if (socket.id !== roomState.hostId) return;
+
         io.emit('generating-quizzes', '問題を生成中です。少々お待ちください...');
         
         Object.keys(roomState.players).forEach(id => { roomState.players[id].currentScore = 0; });
@@ -242,16 +267,27 @@ io.on('connection', (socket) => {
         }
     }
 
-    // 切断時の処理
+    // 5. 切断時のホスト引き継ぎロジック
     socket.on('disconnect', () => {
+        console.log(`ユーザー切断: ${roomState.players[socket.id]?.name}`);
         delete roomState.players[socket.id];
-        delete roomState.confirmedPlayers[socket.id]; // 確認リストからも削除
-        io.emit('room-update', roomState);
+        delete roomState.confirmedPlayers[socket.id];
 
-        // 結果画面のときに誰かが切断した場合、ゲームが詰まらないように再チェック
-        if (roomState.status === 'QUIZ_RESULT') {
-            checkAllConfirmed();
+        // もし切断したのがホストだった場合、ホスト権限を移譲する
+        if (socket.id === roomState.hostId) {
+            const remainingPlayerIds = Object.keys(roomState.players);
+            if (remainingPlayerIds.length > 0) {
+                // 残ったプレイヤーの先頭（次に入室が早かった人）を新ホストにする
+                roomState.hostId = remainingPlayerIds[0];
+                console.log(`ホストが切断したため、新ホストに権限を移譲しました: ${roomState.players[roomState.hostId].name}`);
+            } else {
+                // 誰もいなくなったらホストを空にする
+                roomState.hostId = null;
+            }
         }
+
+        io.emit('room-update', roomState);
+        if (roomState.status === 'QUIZ_RESULT') { checkAllConfirmed(); }
     });
 });
 
