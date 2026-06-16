@@ -56,7 +56,7 @@ async function generateQuizzes(config) {
     if (apiKey) {
         try {
             const ai = new GoogleGenAI({ apiKey: apiKey });
-            const prompt = `ジャンル: ${config.genre}, 難易度: ${config.difficulty}, 問題数: ${config.count}の早押しクイズを、以下のフォーマットのJSON配列のみで出力してください。[\n  {\n    "question": "問題文",\n    "answers": ["正解", "別解"],\n    "explanation": "解説"\n  }\n]`;
+            const prompt = `ジャンル: ${config.genre}, 難易度: ${config.difficulty}, 問題数: ${config.count}の早押しクイズを、以下のフォーマットのJSON配列のみで出力してください。[\n  {\n    "question": "問題文",\n    "answers": ["正解", "別解"],\n    "explanation": "解説"\n  }\n]|「問題文」は「逆算の法則」（正解を先に決め、マニアックな情報（難）から有名な情報（易）へと、段階的にヒントを並べる）を用いて50文字〜80文字程度を目安に作成してください。`;
             const response = await ai.models.generateContent({ model: 'gemini-2.5-flash', contents: prompt });
             const jsonString = response.text.trim().replace(/^```json/, '').replace(/```$/, '').trim();
             const newQuizzes = JSON.parse(jsonString);
