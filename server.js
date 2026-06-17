@@ -56,43 +56,55 @@ let roomState = {
 async function generateQuizzes(config) {
     const apiKey = process.env.GEMINI_API_KEY;
     if (apiKey) {
-        try {
-            console.log("Gemini API で高速逆算クイズを生成中...");
-            const ai = new GoogleGenAI({ apiKey: apiKey });
-            
-            // 指示を極限までシンプルにし、出力を「JSONのみ」と徹底させてAIの思考速度を最適化
-            const prompt = `
-            条件に従う早押しクイズを【JSON配列のみ】で出力。説明不要。
-            条件:
-            - ジャンル: ${config.genre}
-            - 難易度: ${config.difficulty}
-            - 縛りキーワード: ${config.keyword || "特になし"}
-            - 問題数: ${config.count}
-            - 【最重要・問題文のルール】: 正解を先に決め、マニアックな情報（難）から有名な情報（易）へと、段階的にヒントを並べる「逆算の法則」を徹底すること。文字数は50文字〜80文字目安。
-            フォーマット:
-            [{"question": "問題文","answers": ["正解", "ひらがな正解"],"explanation": "解説"}]`;
+        // 最大2回までチャレンジする
+        for (let attempt = 1; attempt <= 2; attempt++) {
+            try {
+                console.log(`Gemini API で高速逆算クイズを生成中... (試行 ${attempt} 回目)`);
+                const ai = new GoogleGenAI({ apiKey: apiKey });
+                
+                const prompt = `
+                条件に従う早押しクイズを【JSON配列のみ】で出力。説明不要。
+                条件:
+                - ジャンル: ${config.genre}
+                - 難易度: ${config.difficulty}
+                - 縛りキーワード: ${config.keyword || "特になし"}
+                - 問題数: ${config.count}
+                - 【最重要・問題文のルール】: 正解を先に決め、マニアックな情報（難）から有名な情報（易）へと、段階的にヒントを並べる「逆算の法則」を徹底すること。文字数は50文字〜80文字目安。
+                フォーマット:
+                [{"question": "問題文","answers": ["正解", "ひらがな正解"],"explanation": "解説"}]`;
 
-            const response = await ai.models.generateContent({
-                model: 'gemini-2.5-flash', // 超高速・最軽量モデル
-                contents: prompt,
-            });
+                const response = await ai.models.generateContent({
+                    model: 'gemini-2.5-flash', 
+                    contents: prompt,
+                });
 
-            const text = response.text.trim();
-            const jsonString = text.replace(/^```json/, '').replace(/```$/, '').trim();
-            const newQuizzes = JSON.parse(jsonString);
+                const text = response.text.trim();
+                const jsonString = text.replace(/^```json/, '').replace(/```$/, '').trim();
+                const newQuizzes = JSON.parse(jsonString);
 
-            const quizzesWithMeta = newQuizzes.map(q => ({
-                ...q, genre: config.genre, difficulty: config.difficulty, keyword: config.keyword
-            }));
+                const quizzesWithMeta = newQuizzes.map(q => ({
+                    ...q, genre: config.genre, difficulty: config.difficulty, keyword: config.keyword
+                }));
 
-            saveQuizzesToCache(quizzesWithMeta);
-            return quizzesWithMeta;
+                saveQuizzesToCache(quizzesWithMeta);
+                return quizzesWithMeta; // 成功したらここで関数を抜ける
 
-        } catch (error) {
-            console.error("Gemini Error, fallback to cache:", error);
+            } catch (error) {
+                console.error(`試行 ${attempt} 回目でエラーが発生しました:`, error.message);
+                
+                // 1回目の失敗かつ503エラーなら、1.5秒待って次ループ（再チャレンジ）へ
+                if (attempt === 1 && error.message.includes("503")) {
+                    console.log("503高負荷エラーのため、1.5秒後に再試行します...");
+                    await new Promise(resolve => setTimeout(resolve, 1500));
+                } else {
+                    // 2回目もダメ、または503以外の致命的エラーならループを抜けてキャッシュ処理へ
+                    break;
+                }
+            }
         }
     }
-
+    
+    console.log("Gemini APIが利用できないため、キャッシュデータから取得します。");
     // キャッシュからの検索（お題縛りも考慮）
     const cachedData = loadQuizzesFromCache();
     const filtered = cachedData.filter(q => 
