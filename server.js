@@ -137,13 +137,33 @@ io.on('connection', (socket) => {
     io.emit('room-update', roomState);
 
     // 設定変更
-    socket.on('set-config', (config) => {
-        if (roomState.status !== 'LOBBY' || socket.id !== roomState.hostId) return;
-        roomState.config = config;
-        socket.emit('config-saved', '設定を保存しました！');
+    socket.on('set-config', (newConfig) => {
+        // ホスト以外の不正操作をガード
+        if (socket.id !== roomState.hostId) return;
+    
+        // 部屋の設定を安全に更新
+        roomState.config = {
+            genre: String(newConfig.genre || '一般'),
+            keyword: String(newConfig.keyword || ''),
+            difficulty: String(newConfig.difficulty || '中級'),
+            count: parseInt(newConfig.count) || 5,
+            continueOnWrong: newConfig.continueOnWrong === true,
+            wrongLimit: parseInt(newConfig.wrongLimit) || 2,
+            answerLimit: parseInt(newConfig.answerLimit) || 10,
+            thinkingLimit: parseInt(newConfig.thinkingLimit) || 7,
+            plusScore: parseInt(newConfig.plusScore) || 10,
+            minusScore: parseInt(newConfig.minusScore) || 5
+        };
+    
+        console.log('ゲーム設定が更新されました:', roomState.config);
+    
+        // ★【ここが漏れていました】設定完了を「config-saved」イベントで全員に通知！
+        io.emit('config-saved', `⚙️ ホストによってゲーム設定が更新・同期されました！`);
+    
+        // 全員の画面（グレーアウトやフォームの値）を一斉に最新状態に同期
         io.emit('room-update', roomState);
     });
-
+    
     // ゲーム開始
     socket.on('game-start', async () => {
         if (roomState.status !== 'LOBBY' || socket.id !== roomState.hostId) return;
