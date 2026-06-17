@@ -18,25 +18,27 @@ app.use(express.static('public'));
 const CACHE_FILE_PATH = path.join(__dirname, 'quizzes_cache.json');
 const DEFAULT_QUIZZES = [
     {
-        genre: "一般", difficulty: "中級",
-        question: "日本の現在の首都であり、世界最大の人口を有する都市はどこでしょう？",
-        answers: ["東京", "とうきょう", "tokyo", "東京都"],
-        explanation: "日本の事実上の首都は東京都です。"
+        genre: "一般", difficulty: "中級", keyword: "",
+        question: "1989年に日本で導入され当初は3%だった、商品の購入時などに広く課される税金は何でしょう？",
+        answers: ["消費税", "しょうひぜい"],
+        explanation: "正解は消費税です。段階的に税率が引き上げられてきました。"
     }
 ];
 
 let roomState = {
     status: 'LOBBY',
-    hostId: null, // ★追加：現在誰がホスト（室長）なのかのSocketIDを保持
+    hostId: null,
     config: { 
         genre: '一般', 
         difficulty: '中級', 
+        keyword: '',             // ★4.キーワード（お題）縛り
         count: 5,
-        continueOnWrong: true,   // 誤答時に早押し続行するか
-        answerLimit: 10,         // 解答制限時間(秒)
-        thinkingLimit: 7,        // 読み上げ後の猶予時間(秒)
-        plusScore: 10,           // 正解時の加点
-        minusScore: 5            // 誤答時の減点
+        continueOnWrong: true,   
+        wrongLimit: 2,           // ★3.お手つきペナルティ（n回誤答でこの問題は解答不可）
+        answerLimit: 10,         
+        thinkingLimit: 7,        
+        plusScore: 10,           
+        minusScore: 5            
     },
     players: {}, 
     quizzes: [],
@@ -44,32 +46,64 @@ let roomState = {
     activePlayerId: null,
     textTimer: null,
     answerTimer: null,
-    thinkingTimer: null,         // 読み上げ後の猶予用タイマー
+    thinkingTimer: null,         
     displayedTextLength: 0,
-    wrongPlayersInRound: [],     // このラウンドで誤答して解答権を失った人
-    confirmedPlayers: {}         // 確認ボタンを押したプレイヤーの記録 { socketId: true }
+    wrongCountsInRound: {},      // ★3.このラウンドでのプレイヤー毎の誤答回数 { socketId: 1 }
+    confirmedPlayers: {}         
 };
 
-// --- Gemini API & キャッシュロジック (前回同様のため省略可、内部処理は維持) ---
+// --- Gemini API & 最適化された高速生成ロジック ---
 async function generateQuizzes(config) {
     const apiKey = process.env.GEMINI_API_KEY;
     if (apiKey) {
         try {
+            console.log("Gemini API で高速逆算クイズを生成中...");
             const ai = new GoogleGenAI({ apiKey: apiKey });
-            const prompt = `ジャンル: ${config.genre}, 難易度: ${config.difficulty}, 問題数: ${config.count}の早押しクイズを、以下のフォーマットのJSON配列のみで出力してください。[\n  {\n    "question": "問題文",\n    "answers": ["正解", "別解"],\n    "explanation": "解説"\n  }\n]|「問題文」は「逆算の法則」（正解を先に決め、マニアックな情報（難）から有名な情報（易）へと、段階的にヒントを並べる）を用いて50文字〜80文字程度を目安に作成してください。`;
-            const response = await ai.models.generateContent({ model: 'gemini-2.5-flash', contents: prompt });
-            const jsonString = response.text.trim().replace(/^```json/, '').replace(/```$/, '').trim();
+            
+            // 指示を極限までシンプルにし、出力を「JSONのみ」と徹底させてAIの思考速度を最適化
+            const prompt = `
+            条件に従う早押しクイズを【JSON配列のみ】で出力。説明不要。
+            条件:
+            - ジャンル: ${config.genre}
+            - 難易度: ${config.difficulty}
+            - 縛りキーワード: ${config.keyword || "特になし"}
+            - 問題数: ${config.count}
+            - 【最重要・問題文のルール】: 正解を先に決め、マニアックな情報（難）から有名な情報（易）へと、段階的にヒントを並べる「逆算の法則」を徹底すること。文字数は50文字〜80文字目安。
+            フォーマット:
+            [{"question": "問題文","answers": ["正解", "ひらがな正解"],"explanation": "解説"}]`;
+
+            const response = await ai.models.generateContent({
+                model: 'gemini-2.5-flash', // 超高速・最軽量モデル
+                contents: prompt,
+            });
+
+            const text = response.text.trim();
+            const jsonString = text.replace(/^```json/, '').replace(/```$/, '').trim();
             const newQuizzes = JSON.parse(jsonString);
-            const quizzesWithMeta = newQuizzes.map(q => ({ ...q, genre: config.genre, difficulty: config.difficulty }));
+
+            const quizzesWithMeta = newQuizzes.map(q => ({
+                ...q, genre: config.genre, difficulty: config.difficulty, keyword: config.keyword
+            }));
+
             saveQuizzesToCache(quizzesWithMeta);
             return quizzesWithMeta;
+
         } catch (error) {
-            console.error("Gemini Error:", error);
+            console.error("Gemini Error, fallback to cache:", error);
         }
     }
+
+    // キャッシュからの検索（お題縛りも考慮）
     const cachedData = loadQuizzesFromCache();
-    const filtered = cachedData.filter(q => q.genre === config.genre && q.difficulty === config.difficulty);
-    if (filtered.length >= config.count) return filtered.sort(() => 0.5 - Math.random()).slice(0, config.count);
+    const filtered = cachedData.filter(q => 
+        q.genre === config.genre && 
+        q.difficulty === config.difficulty &&
+        (!config.keyword || q.keyword === config.keyword)
+    );
+
+    if (filtered.length >= config.count) {
+        return filtered.sort(() => 0.5 - Math.random()).slice(0, config.count);
+    }
     return DEFAULT_QUIZZES;
 }
 
@@ -97,45 +131,24 @@ function checkAnswer(input, validAnswers) {
 
 io.on('connection', (socket) => {
     const nickname = socket.handshake.query.name || `ゲスト_${socket.id.slice(0,4)}`;
-    
-    // 1. プレイヤーを登録する前に、部屋が空（＝自分が最初の1人目）か確認
     const isFirstPlayer = Object.keys(roomState.players).length === 0;
 
-    roomState.players[socket.id] = { 
-        id: socket.id, 
-        name: nickname, 
-        currentScore: 0, 
-        totalScore: 0 
-    };
-
-    // 2. 最初の1人目なら、その人をホストに指名
-    if (isFirstPlayer) {
-        roomState.hostId = socket.id;
-        console.log(`初代ホストが決定しました: ${nickname}`);
-    }
-
+    roomState.players[socket.id] = { id: socket.id, name: nickname, currentScore: 0, totalScore: 0 };
+    if (isFirstPlayer) roomState.hostId = socket.id;
     io.emit('room-update', roomState);
 
-    // 3. 【権限チェック】設定変更
+    // 設定変更
     socket.on('set-config', (config) => {
-        if (roomState.status !== 'LOBBY') return;
-        // 送信者がホストではない場合は拒否
-        if (socket.id !== roomState.hostId) {
-            socket.emit('config-saved', 'エラー：設定を変更できるのはホストだけです。');
-            return;
-        }
+        if (roomState.status !== 'LOBBY' || socket.id !== roomState.hostId) return;
         roomState.config = config;
         socket.emit('config-saved', '設定を保存しました！');
         io.emit('room-update', roomState);
     });
 
-    // 4. 【権限チェック】ゲーム開始
+    // ゲーム開始
     socket.on('game-start', async () => {
-        if (roomState.status !== 'LOBBY') return;
-        // 送信者がホストではない場合は無視
-        if (socket.id !== roomState.hostId) return;
-
-        io.emit('generating-quizzes', '問題を生成中です。少々お待ちください...');
+        if (roomState.status !== 'LOBBY' || socket.id !== roomState.hostId) return;
+        io.emit('generating-quizzes', '逆算思考で問題を生成中です。少々お待ちください...');
         
         Object.keys(roomState.players).forEach(id => { roomState.players[id].currentScore = 0; });
         roomState.quizzes = await generateQuizzes(roomState.config);
@@ -146,11 +159,12 @@ io.on('connection', (socket) => {
     // 早押しボタン
     socket.on('buzz', () => {
         if (roomState.status !== 'QUIZ_TEXT') return;
-        if (roomState.wrongPlayersInRound.includes(socket.id)) return;
+        // お手つき制限に達しているプレイヤーは押せない
+        const currentWrongCount = roomState.wrongCountsInRound[socket.id] || 0;
+        if (currentWrongCount >= roomState.config.wrongLimit) return;
 
-        // 文字送りタイマー、およびシンキングタイマー（毎秒のやつ）を完全に止める
         clearInterval(roomState.textTimer);
-        clearInterval(roomState.thinkingTimer); 
+        clearInterval(roomState.thinkingTimer);
 
         roomState.status = 'QUIZ_ANSWER';
         roomState.activePlayerId = socket.id;
@@ -183,71 +197,101 @@ io.on('connection', (socket) => {
         const pid = roomState.activePlayerId;
 
         if (isCorrect) {
-            // 正解時
             if (pid) {
                 roomState.players[pid].currentScore += roomState.config.plusScore;
                 roomState.players[pid].totalScore += roomState.config.plusScore;
             }
             goToResultView(isCorrect, answerText, quiz);
         } else {
-            // 誤答時
             if (pid) {
                 roomState.players[pid].currentScore -= roomState.config.minusScore;
                 roomState.players[pid].totalScore -= roomState.config.minusScore;
-                roomState.wrongPlayersInRound.push(pid); // 誤答リスト入り
+                // お手つきカウントを加算
+                roomState.wrongCountsInRound[pid] = (roomState.wrongCountsInRound[pid] || 0) + 1;
             }
 
-            // まだ解答していない人がいて、かつ「誤答時続行」がONなら、早押しを再開
-            const totalPlayers = Object.keys(roomState.players).length;
-            if (roomState.config.continueOnWrong && roomState.wrongPlayersInRound.length < totalPlayers) {
+            // まだ「お手つき上限未満」のプレイヤーが残っているかチェック
+            const totalPlayers = Object.keys(roomState.players);
+            const alivePlayers = totalPlayers.filter(id => (roomState.wrongCountsInRound[id] || 0) < roomState.config.wrongLimit);
+
+            if (roomState.config.continueOnWrong && alivePlayers.length > 0) {
                 resumeQuizRound();
             } else {
-                // 全員誤答、または続行OFFなら結果表示へ
                 goToResultView(isCorrect, answerText, quiz);
             }
         }
     }
 
-    // 結果・解説画面への移行
+    // ★2. ホスト用強制コマンドの処理
+    socket.on('host-control', (action) => {
+        if (socket.id !== roomState.hostId) return; // ホスト以外は拒否
+        const quiz = roomState.quizzes[roomState.currentQuizIndex];
+
+        if (action === 'skip') {
+            // 現在のフェーズが何であれ、すべてのタイマーを止めて強制スルー（解説へ）
+            clearInterval(roomState.textTimer);
+            clearInterval(roomState.thinkingTimer);
+            clearInterval(roomState.answerTimer);
+            goToResultView(false, "(ホストによる強制スキップ)", quiz);
+        } 
+        else if (action === 'force-correct' && roomState.status === 'QUIZ_RESULT') {
+            // さっき解答したプレイヤーを「不正解」から「正解」に上書き救済する
+            const pid = roomState.activePlayerId;
+            if (pid && roomState.players[pid]) {
+                // 間違えて引かれた分を戻し、さらに正解ポイントを与える
+                roomState.players[pid].currentScore += (roomState.config.minusScore + roomState.config.plusScore);
+                roomState.players[pid].totalScore += (roomState.config.minusScore + roomState.config.plusScore);
+                io.emit('host-override-notice', `ホスト権限により、${roomState.players[pid].name} の解答が【正解】に上書きされました！`);
+                io.emit('room-update', roomState);
+            }
+        }
+        else if (action === 'force-wrong' && roomState.status === 'QUIZ_RESULT') {
+            // さっき解答したプレイヤーを「正解」から「不正解」に厳罰上書きする
+            const pid = roomState.activePlayerId;
+            if (pid && roomState.players[pid]) {
+                // 正解で足された分を引き、さらに誤答ペナルティを引く
+                roomState.players[pid].currentScore -= (roomState.config.plusScore + roomState.config.minusScore);
+                roomState.players[pid].totalScore -= (roomState.config.plusScore + roomState.config.minusScore);
+                io.emit('host-override-notice', `ホスト権限により、${roomState.players[pid].name} の解答が【不正解】に上書きされました。`);
+                io.emit('room-update', roomState);
+            }
+        }
+    });
+
     function goToResultView(isCorrect, answerText, quiz) {
         roomState.status = 'QUIZ_RESULT';
-        roomState.confirmedPlayers = {}; // 確認状況リセット
-        
+        roomState.confirmedPlayers = {}; 
         io.emit('quiz-round-result', {
             isCorrect,
             answeredPlayer: roomState.activePlayerId ? roomState.players[roomState.activePlayerId].name : "なし",
             answerText: answerText,
             correctAnswer: quiz.answers[0],
             explanation: quiz.explanation,
-            fullQuestion: quiz.question // ★追加：問題の全文を送信
+            fullQuestion: quiz.question 
         });
         io.emit('room-update', roomState);
     }
 
-    // 早押し継続処理
     function resumeQuizRound() {
         roomState.status = 'QUIZ_TEXT';
         roomState.activePlayerId = null;
         io.emit('room-update', roomState);
-    
+        
         const quiz = roomState.quizzes[roomState.currentQuizIndex];
         if (roomState.displayedTextLength < quiz.question.length) {
             runTextTimer(quiz);
         } else {
-            startThinkingTimer(quiz); // 再開時もカウントダウンを回す
+            startThinkingTimer(quiz);
         }
     }
-    
-    // 確認ボタンが押されたとき
+
     socket.on('confirm-next', () => {
         if (roomState.status !== 'QUIZ_RESULT') return;
         roomState.confirmedPlayers[socket.id] = true;
-        
         checkAllConfirmed();
     });
 
     function checkAllConfirmed() {
-        // 現在接続しているプレイヤー全員が確認したかチェック
         const activePlayerIds = Object.keys(roomState.players);
         const isAllConfirmed = activePlayerIds.every(id => roomState.confirmedPlayers[id] === true);
 
@@ -261,30 +305,18 @@ io.on('connection', (socket) => {
                 io.emit('room-update', roomState);
             }
         } else {
-            // 現在の確認状況を全員に同期
             io.emit('confirm-update', roomState.confirmedPlayers);
         }
     }
 
-    // 5. 切断時のホスト引き継ぎロジック
     socket.on('disconnect', () => {
-        console.log(`ユーザー切断: ${roomState.players[socket.id]?.name}`);
         delete roomState.players[socket.id];
         delete roomState.confirmedPlayers[socket.id];
-
-        // もし切断したのがホストだった場合、ホスト権限を移譲する
+        
         if (socket.id === roomState.hostId) {
             const remainingPlayerIds = Object.keys(roomState.players);
-            if (remainingPlayerIds.length > 0) {
-                // 残ったプレイヤーの先頭（次に入室が早かった人）を新ホストにする
-                roomState.hostId = remainingPlayerIds[0];
-                console.log(`ホストが切断したため、新ホストに権限を移譲しました: ${roomState.players[roomState.hostId].name}`);
-            } else {
-                // 誰もいなくなったらホストを空にする
-                roomState.hostId = null;
-            }
+            roomState.hostId = remainingPlayerIds.length > 0 ? remainingPlayerIds[0] : null;
         }
-
         io.emit('room-update', roomState);
         if (roomState.status === 'QUIZ_RESULT') { checkAllConfirmed(); }
     });
@@ -294,16 +326,14 @@ function startQuizRound() {
     roomState.status = 'QUIZ_TEXT';
     roomState.activePlayerId = null;
     roomState.displayedTextLength = 0;
-    roomState.wrongPlayersInRound = []; // ラウンド毎にリセット
+    roomState.wrongCountsInRound = {}; // ラウンド毎に誤答数をリセット
     const quiz = roomState.quizzes[roomState.currentQuizIndex];
 
     io.emit('quiz-start', { index: roomState.currentQuizIndex });
     io.emit('room-update', roomState);
-
     runTextTimer(quiz);
 }
 
-// 文字送りロジックを分離
 function runTextTimer(quiz) {
     roomState.textTimer = setInterval(() => {
         roomState.displayedTextLength++;
@@ -312,40 +342,24 @@ function runTextTimer(quiz) {
 
         if (roomState.displayedTextLength >= quiz.question.length) {
             clearInterval(roomState.textTimer);
-            startThinkingTimer(quiz); // 読み上げ後の猶予時間へ
+            startThinkingTimer(quiz); 
         }
     }, 150);
 }
 
-// 読み上げ後の猶予時間（シンキングタイム）タイマー
 function startThinkingTimer(quiz) {
     let thinkingCountdown = roomState.config.thinkingLimit;
-    
-    // 最初の一秒目を即座に通知
     io.emit('thinking-timer', thinkingCountdown);
 
-    // 1秒ごとにカウントダウンを刻む
     roomState.thinkingTimer = setInterval(() => {
         thinkingCountdown--;
         io.emit('thinking-timer', thinkingCountdown);
 
         if (thinkingCountdown <= 0) {
-            clearInterval(roomState.thinkingTimer); // インターバルタイマーをクリア
-            
-            // 誰もおさずにタイムアップ
-            roomState.status = 'QUIZ_RESULT';
-            roomState.confirmedPlayers = {};
-            
-            io.emit('quiz-round-result', {
-                isCorrect: false,
-                answeredPlayer: "なし",
-                answerText: "(タイムアップ)",
-                correctAnswer: quiz.answers[0],
-                explanation: quiz.explanation,
-                fullQuestion: quiz.question // ★追加：問題の全文を送信
-            });
-            io.emit('room-update', roomState);
+            clearInterval(roomState.thinkingTimer); 
+            goToResultView(false, "(タイムアップ)", quiz);
         }
     }, 1000);
 }
+
 server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
