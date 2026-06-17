@@ -349,15 +349,35 @@ function runTextTimer(quiz) {
 
 function startThinkingTimer(quiz) {
     let thinkingCountdown = roomState.config.thinkingLimit;
+    
+    // 最初の一秒目を即座に通知
     io.emit('thinking-timer', thinkingCountdown);
+
+    // 以前のタイマーが万が一残っていたら確実にクリアしておく安全策
+    clearInterval(roomState.thinkingTimer);
 
     roomState.thinkingTimer = setInterval(() => {
         thinkingCountdown--;
         io.emit('thinking-timer', thinkingCountdown);
 
         if (thinkingCountdown <= 0) {
+            // ★【重要バグ修正】: カウントが0になったら、即座にこのインターバルタイマーを消滅させる！
             clearInterval(roomState.thinkingTimer); 
-            goToResultView(false, "(タイムアップ)", quiz);
+            roomState.thinkingTimer = null; // 完全に参照をクリア
+            
+            // 誰もおさずにタイムアップしたため、結果表示画面へ移行
+            roomState.status = 'QUIZ_RESULT';
+            roomState.confirmedPlayers = {};
+            
+            io.emit('quiz-round-result', {
+                isCorrect: false,
+                answeredPlayer: "なし",
+                answerText: "(タイムアップ)",
+                correctAnswer: quiz.answers[0],
+                explanation: quiz.explanation,
+                fullQuestion: quiz.question 
+            });
+            io.emit('room-update', roomState);
         }
     }, 1000);
 }
