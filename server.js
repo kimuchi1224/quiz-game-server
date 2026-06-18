@@ -37,7 +37,20 @@ let roomState = {
     wrongCountsInRound: {},      
     confirmedPlayers: {},
     roundAnswersLog: [] // ★追加：このラウンドの全解答ログ [{ name: "...", text: "...", isCorrect: false, playerId: "..." }]
+    gameWrongCounts: {}, // プレイヤーごとの累計お手つき数 { socketId: count }
+    isDisqualified: {}   // プレイヤーが失格しているか { socketId: true/false }
 };
+
+function initGame() {
+    roomState.currentQuizIndex = 0;
+    roomState.gameWrongCounts = {};
+    roomState.isDisqualified = {};
+    for (let id in roomState.players) {
+        roomState.players[id].currentScore = 0;
+        roomState.gameWrongCounts[id] = 0;
+        roomState.isDisqualified[id] = false;
+    }
+}
 
 // --- Gemini API & 最適化された高速生成ロジック ---
 async function generateQuizzes(config) {
@@ -154,6 +167,8 @@ io.on('connection', (socket) => {
             plusScore: parseInt(newConfig.plusScore) || 10,
             minusScore: parseInt(newConfig.minusScore) || 5
         };
+        roomState.config.winScore = parseInt(newConfig.winScore) || 30; // 追加
+        roomState.config.gameWrongLimit = parseInt(newConfig.gameWrongLimit) || 3; // 追加
     
         console.log('ゲーム設定が更新されました:', roomState.config);
     
@@ -217,13 +232,9 @@ io.on('connection', (socket) => {
         const pid = roomState.activePlayerId;
         const pName = pid ? roomState.players[pid].name : "なし";
     
-        // ★追加：解答ログに今回のデータをプッシュ
         if (pid) {
             roomState.roundAnswersLog.push({
-                playerId: pid,
-                name: pName,
-                text: answerText || "(タイムアウト)",
-                isCorrect: isCorrect
+                playerId: pid, name: pName, text: answerText || "(タイムアウト)", isCorrect: isCorrect
             });
         }
     
@@ -231,32 +242,63 @@ io.on('connection', (socket) => {
             if (pid) {
                 roomState.players[pid].currentScore += roomState.config.plusScore;
                 roomState.players[pid].totalScore += roomState.config.plusScore;
+                
+                // ★追加：ポイント先取チェック
+                if (roomState.players[pid].currentScore >= roomState.config.winScore) {
+                    goToResultView(isCorrect, answerText, quiz);
+                    endGameWithWinner(pName); // 規定ポイント到達でゲーム終了へ
+                    return;
+                }
             }
             goToResultView(isCorrect, answerText, quiz);
         } else {
             if (pid) {
                 roomState.players[pid].currentScore -= roomState.config.minusScore;
                 roomState.players[pid].totalScore -= roomState.config.minusScore;
+                
                 roomState.wrongCountsInRound[pid] = (roomState.wrongCountsInRound[pid] || 0) + 1;
+                
+                // ★追加：ゲーム全体の累計お手つきをカウント＆失格判定
+                roomState.gameWrongCounts[pid] = (roomState.gameWrongCounts[pid] || 0) + 1;
+                if (roomState.gameWrongCounts[pid] >= roomState.config.gameWrongLimit) {
+                    roomState.isDisqualified[pid] = true;
+                    io.emit('host-override-notice', `🚨 ${pName} さんが累計お手つき上限（${roomState.config.gameWrongLimit}回）に達したため【失格】となりました！`);
+                }
             }
     
+            // まだ失格しておらず、このラウンドでお手つき上限に達していないアクティブなプレイヤー
             const totalPlayers = Object.keys(roomState.players);
-            const alivePlayers = totalPlayers.filter(id => (roomState.wrongCountsInRound[id] || 0) < roomState.config.wrongLimit);
+            const alivePlayers = totalPlayers.filter(id => 
+                !roomState.isDisqualified[id] && 
+                (roomState.wrongCountsInRound[id] || 0) < roomState.config.wrongLimit
+            );
     
-            // 他に答えられる人がいて、続行ルールなら早押しに戻す
             if (roomState.config.continueOnWrong && alivePlayers.length > 0) {
-                // ★修正：誤答した瞬間の「✕」演出を一度クライアントに通知し、クイズ画面へ復帰
-                io.emit('wrong-mid-quiz', { 
-                    wrongPlayer: pName, 
-                    answerText: answerText || "(タイムアウト)",
-                    roomState: roomState 
-                });
+                io.emit('wrong-mid-quiz', { wrongPlayer: pName, answerText: answerText || "(タイムアウト)", roomState: roomState });
                 resumeQuizRound();
             } else {
-                // 全員お手つき、または続行しない場合は解説画面へ
+                // 全員が失格またはお手つきになった、もしくは続行しない設定
                 goToResultView(isCorrect, answerText, quiz);
+                
+                // ★生存者が0人になった場合のゲームオーバーチェック
+                const querySurvivers = totalPlayers.filter(id => !roomState.isDisqualified[id]);
+                if (querySurvivers.length === 0) {
+                    endGameWithNoSurvivers();
+                }
             }
         }
+    }
+
+    // 先取勝利時の強制終了
+    function endGameWithWinner(winnerName) {
+        roomState.status = 'QUIZ_RESULT'; // 一旦リザルトを見せる
+        io.emit('game-over-winner', { winner: winnerName, msg: `🎉 ${winnerName} さんが規定の ${roomState.config.winScore} 点に達したため、クイズを終了します！勝利おめでとうございます！` });
+    }
+    
+    // 全員失格時の強制終了
+    function endGameWithNoSurvivers() {
+        roomState.status = 'QUIZ_RESULT';
+        io.emit('game-over-winner', { winner: "なし", msg: `💀 生存しているプレイヤーが全員【失格】となったため、ゲームを途中で終了します。` });
     }
     
     // ★2. ホスト用強制コマンドの処理
