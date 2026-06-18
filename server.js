@@ -36,7 +36,7 @@ let roomState = {
     textTimer: null, answerTimer: null, thinkingTimer: null, displayedTextLength: 0,
     wrongCountsInRound: {},      
     confirmedPlayers: {},
-    roundAnswersLog: [] // ★追加：このラウンドの全解答ログ [{ name: "...", text: "...", isCorrect: false, playerId: "..." }]
+    roundAnswersLog: [],
     gameWrongCounts: {}, // プレイヤーごとの累計お手つき数 { socketId: count }
     isDisqualified: {}   // プレイヤーが失格しているか { socketId: true/false }
 };
