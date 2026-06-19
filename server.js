@@ -153,10 +153,10 @@ io.on('connection', (socket) => {
 
     // 設定変更
     socket.on('set-config', (newConfig) => {
-        // ホスト以外の不正操作をガード
+        // 1. ホスト以外の不正操作をガード
         if (socket.id !== roomState.hostId) return;
     
-        // 部屋の設定を安全に更新
+        // 2. 部屋の設定を安全かつ確実にパースして更新（全11項目を完全網羅）
         roomState.config = {
             genre: String(newConfig.genre || '一般'),
             keyword: String(newConfig.keyword || ''),
@@ -164,20 +164,23 @@ io.on('connection', (socket) => {
             count: parseInt(newConfig.count) || 5,
             continueOnWrong: newConfig.continueOnWrong === true,
             wrongLimit: parseInt(newConfig.wrongLimit) || 2,
+            
+            // ★重要：ここが既存の古い項目で上書きされて消えないよう、確実に型変換して格納
+            winScore: parseInt(newConfig.winScore) || 30,
+            gameWrongLimit: parseInt(newConfig.gameWrongLimit) || 3,
+            
             answerLimit: parseInt(newConfig.answerLimit) || 10,
             thinkingLimit: parseInt(newConfig.thinkingLimit) || 7,
             plusScore: parseInt(newConfig.plusScore) || 10,
             minusScore: parseInt(newConfig.minusScore) || 5
         };
-        roomState.config.winScore = parseInt(newConfig.winScore) || 30; // 追加
-        roomState.config.gameWrongLimit = parseInt(newConfig.gameWrongLimit) || 3; // 追加
     
-        console.log('ゲーム設定が更新されました:', roomState.config);
+        console.log('--- ゲーム設定が完全に同期されました ---', roomState.config);
     
-        // ★【ここが漏れていました】設定完了を「config-saved」イベントで全員に通知！
-        io.emit('config-saved', `⚙️ ホストによってゲーム設定が更新・同期されました！`);
+        // 3. 設定完了の通知（トースト用の電波）を全員にブロードキャスト
+        io.emit('config-saved', `⚙️ ホストによってゲーム設定（${roomState.config.winScore}点先取 / 失格${roomState.config.gameWrongLimit}回）が更新されました！`);
     
-        // 全員の画面（グレーアウトやフォームの値）を一斉に最新状態に同期
+        // 4. 全員の画面（入力フォームやUI状態）を最新に同期
         io.emit('room-update', roomState);
     });
     
