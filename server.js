@@ -4,7 +4,6 @@ const http = require('http').createServer(app);
 const io = require('socket.io')(http, { cors: { origin: "*" } });
 const { GoogleGenAI } = require('@google/genai');
 
-// Gemini APIの初期化（環境変数から取得）
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 let roomState = {
@@ -13,36 +12,37 @@ let roomState = {
     config: { 
         genre: '一般', difficulty: '中級', keyword: '', count: 5,
         continueOnWrong: true, wrongLimit: 2, gameWrongLimit: 3, winScore: 30,
-        answerLimit: 10, thinkingLimit: 7, plusScore: 10, minusScore: 5            
+        answerLimit: 10, thinkingLimit: 7, plusScore: 10, minusScore: 5,
+        isImageMode: false // ★新規：画像クイズモードフラグ
     },
-    players: {}, quizzes: [], currentQuizIndex: 0, activePlayerId: null,
+    players: {}, 
+    isReady: {}, // ★新規：プレイヤーの準備完了状態管理
+    quizzes: [], currentQuizIndex: 0, activePlayerId: null,
     textTimer: null, answerTimer: null, thinkingTimer: null, displayedTextLength: 0,
     wrongCountsInRound: {},      
     confirmedPlayers: {},
     roundAnswersLog: [],
     gameWrongCounts: {}, 
     isDisqualified: {},
-    isGameOverPending: false
+    isGameOverPending: false,
+
+    // ★新規：早押し同時押し計測用テンポラリデータ
+    buzzWindowOpen: false,
+    firstBuzzTime: 0,
+    roundBuzzLog: [] // 1問の中で誰が何ミリ秒に押したかの全記録
 };
 
-// 高度な表記ゆれ吸収ロジック
 function checkAnswer(userAns, correctAnswers) {
     if (!userAns) return false;
-    
-    // 正規化関数：ひらがな・カタカナの変換、大文字小文字、全角半角の統一
     const normalize = (str) => {
-        return str.trim()
-            .toLowerCase()
-            .replace(/[\u30a1-\u30f6]/g, match => String.fromCharCode(match.charCodeAt(0) - 0x60)) // カタカナをひらがなに
-            .replace(/[\uFF01-\uFF5E]/g, match => String.fromCharCode(match.charCodeAt(0) - 0xfee0)) // 全角英数を半角に
-            .replace(/[ーｰ➖━]/g, '') // 長音記号の無視
-            .replace(/[\s ]/g, ''); // 空白の除去
+        return str.trim().toLowerCase()
+            .replace(/[\u30a1-\u30f6]/g, match => String.fromCharCode(match.charCodeAt(0) - 0x60))
+            .replace(/[\uFF01-\uFF5E]/g, match => String.fromCharCode(match.charCodeAt(0) - 0xfee0))
+            .replace(/[ーｰ➖━]/g, '').replace(/[\s ]/g, '');
     };
-
     const normUser = normalize(userAns);
     return correctAnswers.some(ans => {
         const normAns = normalize(ans);
-        // 完全一致、またはお互いに内包しているか（短い解答の誤判定を防ぐため3文字以上で部分一致も許容）
         if (normUser === normAns) return true;
         if (normAns.length >= 3 && (normUser.includes(normAns) || normAns.includes(normUser))) return true;
         return false;
@@ -56,10 +56,17 @@ io.on('connection', (socket) => {
     roomState.players[socket.id] = { id: socket.id, name: name, currentScore: 0, totalScore: 0 };
     roomState.gameWrongCounts[socket.id] = 0;
     roomState.isDisqualified[socket.id] = false;
+    roomState.isReady[socket.id] = false; // 初期状態は未準備
 
     io.emit('room-update', roomState);
 
-    // 設定反映
+    // ★新規：Ready状態の切り替え
+    socket.on('toggle-ready', () => {
+        if (socket.id === roomState.hostId) return; // ホストはReady不要
+        roomState.isReady[socket.id] = !roomState.isReady[socket.id];
+        io.emit('room-update', roomState);
+    });
+
     socket.on('set-config', (newConfig) => {
         if (socket.id !== roomState.hostId) return;
         roomState.config.genre = String(newConfig.genre || '一般');
@@ -74,58 +81,53 @@ io.on('connection', (socket) => {
         roomState.config.thinkingLimit = parseInt(newConfig.thinkingLimit) || 7;
         roomState.config.plusScore = parseInt(newConfig.plusScore) || 10;
         roomState.config.minusScore = parseInt(newConfig.minusScore) || 5;
+        roomState.config.isImageMode = newConfig.isImageMode === true; // 追加
 
-        io.emit('config-saved', `⚙️ ゲーム設定が更新されました！（${roomState.config.winScore}点先取 / 失格${roomState.config.gameWrongLimit}回）`);
+        io.emit('config-saved', `⚙️ ゲーム設定が更新されました！`);
         io.emit('room-update', roomState);
     });
 
-    // AIによるクイズ生成とゲーム開始
     socket.on('game-start', async () => {
         if (socket.id !== roomState.hostId) return;
-        io.emit('generating-quizzes', "🤖 Gemini AIが厳選クイズを自動生成中。まもなく始まります...");
+        
+        // 全員Readyかチェック（ホスト以外のプレイヤー全員）
+        const guestIds = Object.keys(roomState.players).filter(id => id !== roomState.hostId);
+        const allReady = guestIds.every(id => roomState.isReady[id] === true);
+        if (guestIds.length > 0 && !allReady) {
+            socket.emit('host-override-notice', "⚠️ まだ準備完了していないプレイヤーがいます。");
+            return;
+        }
+
+        io.emit('generating-quizzes', "🤖 Gemini AIが特別クイズセットを編集中...");
 
         try {
+            // ★新規：通常モードと画像モードでプロンプトを切り替え
+            let modePrompt = "";
+            if (roomState.config.isImageMode) {
+                modePrompt = `【超重要：今回は「視覚・画像連想クイズ」です】
+                問題文の冒頭に、必ずそのお題を表す分かりやすい「アスキーアート(AA)」や「■や○で描いたドット絵、絵文字を組み合わせた視覚的アート」を3〜5行程度で挿入してください。
+                その上で、文章として「これは何を表した画像（絵）でしょう？」「この形状を持つ、◯◯といえば何でしょう？」という形式で早押し問題文を作成してください。`;
+            } else {
+                modePrompt = `早押しクイズらしく、最初は一般的な情報から始まり、徐々に核心的な詳細（別名、代表作、〜〜である場所など）が明かされる文章にしてください。`;
+            }
+
             const prompt = `
-                # 役割設定
-                - あなたは「一流のクイズ作家」であり、同時に「厳格なファクトチェッカー」です。
-                - エンターテインメントとして面白く、かつ学術的・歴史的な事実に基づいた「正確で質の高い早押しクイズ」を作成してください。
-                
-                # 目的
-                - 末尾の【作成条件】に従い、指定された条件を満たすハイクオリティな早押しクイズ（問題文、解答、解説）を作成してください。
-                
-                # クイズ作成における必須要件
-                - 情報の正確性（確度）の担保
-                - 諸説ある事実、最新の研究で否定された学説、不確定なネットの噂などは問題文に含めないでください。
-                - 誰が・いつ・どこで検証しても、答えが一つに定まる客観的事実のみを根拠にしてください。
-                
-                # 早押しクイズとしての構造化（スクリーニング効果）
-                - 問題文は「限定要素（パラレル要素）」を意識し、文章が進むにつれて徐々に絞り込まれる構造にしてください。
-                - 「最初の一文で一意に特定できるコアな情報」から始まり、「中盤でヒントが増え」、「終盤で確定する」というグラデーションを意識してください。
-                - 誤読を誘うような悪意のある引っ掛け問題は避け、純粋な知識と推認力で競える構成にしてください。
-                
-                # 解答のバリエーション（多様性）と表記揺れ対応
-                - 答えの対象（人物、地名、作品名、一般名詞、現象名など）に偏りが出ないよう、バラエティ豊かにしてください。
-                - ユーザーが自動採点や柔軟な正誤判定を行えるよう、一般的な呼称、フルネーム、ひらがな、別解などを網羅して出力してください。
-                
-                # 出力形式に関する絶対ルール
-                - 出力は、以下に示す【指定のJSON形式】の仕様に完全に従った、純粋なJSON配列（ valid な JSON ）のみとしてください。
-                - **重要**  レスポンスには、\`\`\`json などのマークダウンのコードブロック、解説テキスト、前置き、結びの言葉などを一切含めないでください。 最初の文字は [ で始まり、最後の文字は ] で終わる、純粋なJSONデータのみを出力してください。
-                
-                【指定のJSON形式】
-                [
-                  {
-                    "question": "問題文",
-                    "answers": ["模範解答（漢字や正式名称）", "ひらがな", "別解やカタカナなど表記ゆれ候補"],
-                    "explanation": "正解の解説文。なぜこれが確実に正解と言えるのかの理由、および確定根拠を2〜3文で記述"
-                  }
-                ]
-                
-                【作成条件】
-                問題数: ${roomState.config.count}
-                ジャンル: ${roomState.config.genre}
-                難易度: ${roomState.config.difficulty}
-                キーワード・テーマ: ${roomState.config.keyword || 'なし'}
-            `;
+            以下の条件で面白い早押しクイズ問題を${roomState.config.count}問作成し、指定のJSON形式のみで出力してください。
+            ジャンル: ${roomState.config.genre}
+            難易度: ${roomState.config.difficulty}
+            キーワード・お題の縛り: ${roomState.config.keyword || 'なし'}
+            
+            ${modePrompt}
+
+            【出力JSONフォーマット】
+            [
+              {
+                "question": "問題文（改行も含めて綺麗にフォーマットしてください）",
+                "answers": ["模範解答", "ひらがな", "別解候補"],
+                "explanation": "正解の解説文"
+              }
+            ]
+            純粋なJSON配列のみを返してください。`;
 
             const response = await ai.models.generateContent({
                 model: 'gemini-2.5-flash',
@@ -133,7 +135,6 @@ io.on('connection', (socket) => {
             });
 
             let rawText = response.text.trim();
-            // 万が一のマークダウンを力技で剥ぎ取る
             if (rawText.startsWith("```")) {
                 rawText = rawText.replace(/^```json/, "").replace(/^```/, "").replace(/```$/, "").trim();
             }
@@ -150,8 +151,8 @@ io.on('connection', (socket) => {
             startQuizRound();
 
         } catch (error) {
-            console.error("AI生成エラー:", error);
-            io.emit('host-override-notice', "❌ クイズ生成に失敗しました。もう一度開始ボタンを押してください。");
+            console.error("生成エラー:", error);
+            io.emit('host-override-notice', "❌ クイズ生成に失敗しました。再試行してください。");
             roomState.status = 'LOBBY';
             io.emit('room-update', roomState);
         }
@@ -167,13 +168,17 @@ io.on('connection', (socket) => {
         roomState.wrongCountsInRound = {};
         roomState.roundAnswersLog = [];
         roomState.displayedTextLength = 0;
+        
+        // 早押し計測初期化
+        roomState.buzzWindowOpen = false;
+        roomState.firstBuzzTime = 0;
+        roomState.roundBuzzLog = [];
 
         io.emit('quiz-start', { index: roomState.currentQuizIndex });
         io.emit('room-update', roomState);
 
         const fullQuestionText = roomState.quizzes[roomState.currentQuizIndex].question;
         
-        // 文字送り（スクロールタイピング演出）の再実装
         roomState.textTimer = setInterval(() => {
             roomState.displayedTextLength++;
             const currentChunk = fullQuestionText.substring(0, roomState.displayedTextLength);
@@ -181,57 +186,77 @@ io.on('connection', (socket) => {
 
             if (roomState.displayedTextLength >= fullQuestionText.length) {
                 clearInterval(roomState.textTimer);
-                startThinkingTimer(); // 読み上げ終了後の猶予タイマーへ
+                startThinkingTimer();
             }
-        }, 120); // 1文字0.12秒ペース
+        }, roomState.config.isImageMode ? 50 : 120); // 画像モード（AA含む）の場合は少し早めに文字出し
     }
 
-    // 読み上げ終了後のシンキングタイマー
     function startThinkingTimer() {
         let countdown = roomState.config.thinkingLimit;
         io.emit('thinking-timer', countdown);
-
         roomState.thinkingTimer = setInterval(() => {
             countdown--;
             io.emit('thinking-timer', countdown);
-
             if (countdown <= 0) {
                 clearInterval(roomState.thinkingTimer);
-                // 誰も押さずにスルー（タイムアウト）
                 goToResultView(null, "(誰も押さずに時間切れ)", roomState.quizzes[roomState.currentQuizIndex]);
             }
         }, 1000);
     }
 
-    // BUZZボタン（早押し検知）
+    // ★修正・拡張：早押しボタン（1秒以内の同時押しラグ計測ロジック）
     socket.on('buzz', () => {
-        if (roomState.status !== 'QUIZ_TEXT') return;
+        if (roomState.status !== 'QUIZ_TEXT' && !roomState.buzzWindowOpen) return;
         if (roomState.isDisqualified[socket.id]) return;
         if ((roomState.wrongCountsInRound[socket.id] || 0) >= roomState.config.wrongLimit) return;
 
-        // 文字送りとシンキングタイマーを即座に「静止」
-        clearInterval(roomState.textTimer);
-        clearInterval(roomState.thinkingTimer);
+        const now = Date.now();
 
-        roomState.status = 'QUIZ_ANSWER';
-        roomState.activePlayerId = socket.id;
-        io.emit('buzzed', { playerId: socket.id, name: roomState.players[socket.id].name });
-        io.emit('room-update', roomState);
+        // 1人目のBUZZ
+        if (!roomState.buzzWindowOpen) {
+            roomState.buzzWindowOpen = true;
+            roomState.firstBuzzTime = now;
+            roomState.status = 'QUIZ_ANSWER';
+            roomState.activePlayerId = socket.id;
 
-        // 回答入力の制限時間タイマー
-        let countdown = roomState.config.answerLimit;
-        io.emit('answer-timer', countdown);
+            clearInterval(roomState.textTimer);
+            clearInterval(roomState.thinkingTimer);
 
-        roomState.answerTimer = setInterval(() => {
-            countdown--;
+            roomState.roundBuzzLog.push({ id: socket.id, name: roomState.players[socket.id].name, delay: 0 });
+
+            io.emit('buzzed', { playerId: socket.id, name: roomState.players[socket.id].name });
+            io.emit('room-update', roomState);
+
+            // 1秒間の同時押し受付ウィンドウを開く
+            setTimeout(() => {
+                roomState.buzzWindowOpen = false; // 1秒経ったら受付終了
+                console.log("早押し同時押し集計結果:", roomState.roundBuzzLog);
+            }, 1000);
+
+            // 解答入力タイマー
+            let countdown = roomState.config.answerLimit;
             io.emit('answer-timer', countdown);
+            roomState.answerTimer = setInterval(() => {
+                countdown--;
+                io.emit('answer-timer', countdown);
+                if (countdown <= 0) {
+                    clearInterval(roomState.answerTimer);
+                    submitAnswerProcess("");
+                }
+            }, 1000);
 
-            if (countdown <= 0) {
-                clearInterval(roomState.answerTimer);
-                // 解答タイムアウト＝誤答扱い
-                submitAnswerProcess("");
+        } else {
+            // ★1秒以内の2人目以降の同時押しを記録
+            // すでにこのウィンドウ内で記録されてないかチェック
+            if (!roomState.roundBuzzLog.some(b => b.id === socket.id)) {
+                const diffTime = ((now - roomState.firstBuzzTime) / 1000).toFixed(3); // 秒単位（小数点3桁）
+                roomState.roundBuzzLog.push({
+                    id: socket.id,
+                    name: roomState.players[socket.id].name,
+                    delay: parseFloat(diffTime)
+                });
             }
-        }, 1000);
+        }
     });
 
     socket.on('submit-answer', (answerText) => {
@@ -270,13 +295,11 @@ io.on('connection', (socket) => {
             const totalPlayers = Object.keys(roomState.players);
             const alivePlayers = totalPlayers.filter(id => !roomState.isDisqualified[id] && (roomState.wrongCountsInRound[id] || 0) < roomState.config.wrongLimit);
 
-            // 他に解答できる人がいて、続行設定なら問題の文字送りを再開
             if (roomState.config.continueOnWrong && alivePlayers.length > 0) {
                 io.emit('wrong-mid-quiz', { wrongPlayer: pName, answerText });
                 roomState.status = 'QUIZ_TEXT';
                 io.emit('room-update', roomState);
 
-                // 文字送り再開
                 const fullQuestionText = quiz.question;
                 roomState.textTimer = setInterval(() => {
                     roomState.displayedTextLength++;
@@ -287,9 +310,8 @@ io.on('connection', (socket) => {
                         clearInterval(roomState.textTimer);
                         startThinkingTimer();
                     }
-                }, 120);
+                }, roomState.config.isImageMode ? 50 : 120);
             } else {
-                // 生存者全滅、または続行しない場合
                 const querySurvivers = totalPlayers.filter(id => !roomState.isDisqualified[id]);
                 if (querySurvivers.length === 0) {
                     roomState.isGameOverPending = true;
@@ -305,7 +327,8 @@ io.on('connection', (socket) => {
         io.emit('quiz-round-result', {
             isCorrect, answeredPlayer: roomState.activePlayerId ? roomState.players[roomState.activePlayerId].name : "なし",
             answerText, correctAnswer: quiz.answers[0], explanation: quiz.explanation, fullQuestion: quiz.question,
-            answersLog: roomState.roundAnswersLog
+            answersLog: roomState.roundAnswersLog,
+            buzzLog: roomState.roundBuzzLog // ★同時押しのラグデータをフロントへ同期
         });
         io.emit('room-update', roomState);
     }
@@ -322,7 +345,6 @@ io.on('connection', (socket) => {
                 triggerGameOver();
                 return;
             }
-
             roomState.currentQuizIndex++;
             if (roomState.currentQuizIndex >= roomState.quizzes.length) {
                 triggerGameOver();
@@ -338,11 +360,9 @@ io.on('connection', (socket) => {
         io.emit('game-over', roomState.players);
     }
 
-    // ホストコントロール（判定上書き・ロビー戻る・キック・譲渡）
     socket.on('host-control', (data) => {
         if (socket.id !== roomState.hostId) return;
 
-        // 1. 判定の上書き
         if (data.action === 'override-log-status') {
             const targetPid = data.playerId;
             const targetLogIndex = data.logIndex;
@@ -385,11 +405,11 @@ io.on('connection', (socket) => {
                 correctAnswer: roomState.quizzes[roomState.currentQuizIndex].answers[0],
                 explanation: roomState.quizzes[roomState.currentQuizIndex].explanation,
                 fullQuestion: roomState.quizzes[roomState.currentQuizIndex].question,
-                answersLog: roomState.roundAnswersLog
+                answersLog: roomState.roundAnswersLog,
+                buzzLog: roomState.roundBuzzLog
             });
             io.emit('room-update', roomState);
         }
-        // 2. ロビーへ戻る
         else if (data.action === 'return-to-lobby') {
             roomState.status = 'LOBBY';
             roomState.quizzes = [];
@@ -399,29 +419,26 @@ io.on('connection', (socket) => {
                 roomState.players[id].currentScore = 0;
                 roomState.gameWrongCounts[id] = 0;
                 roomState.isDisqualified[id] = false;
+                roomState.isReady[id] = false; // レディ状態もリセット
             }
             io.emit('room-update', roomState);
         }
-        // ★追加機能1：プレイヤーキック
         else if (data.action === 'kick-player') {
             const targetId = data.targetId;
             if (targetId && roomState.players[targetId] && targetId !== roomState.hostId) {
                 const targetName = roomState.players[targetId].name;
                 io.to(targetId).emit('kicked-notice', "🚨 あなたはホストによってキックされました。");
-                
-                // ソケット側で強制切断
                 const targetSocket = io.sockets.sockets.get(targetId);
                 if (targetSocket) targetSocket.disconnect();
-                
                 io.emit('host-override-notice', `👋 ${targetName} さんが退出させられました。`);
             }
         }
-        // ★追加機能2：ホスト権限譲渡
         else if (data.action === 'transfer-host') {
             const targetId = data.targetId;
             if (targetId && roomState.players[targetId] && targetId !== roomState.hostId) {
                 roomState.hostId = targetId;
-                io.emit('host-override-notice', `👑 ${roomState.players[targetId].name} さんにホスト権限（ルームマスター）が譲渡されました！`);
+                roomState.isReady[targetId] = false; // 新ホストのReadyフラグを解除
+                io.emit('host-override-notice', `👑 ${roomState.players[targetId].name} さんにホスト権限が譲渡されました！`);
                 io.emit('room-update', roomState);
             }
         }
@@ -431,10 +448,12 @@ io.on('connection', (socket) => {
         delete roomState.players[socket.id];
         delete roomState.gameWrongCounts[socket.id];
         delete roomState.isDisqualified[socket.id];
+        delete roomState.isReady[socket.id];
         if (roomState.hostId === socket.id) {
             roomState.hostId = Object.keys(roomState.players)[0] || null;
             if (roomState.hostId) {
-                io.emit('host-override-notice', `👑 前のホストが切断したため、${roomState.players[roomState.hostId].name} さんに権限が移動しました。`);
+                roomState.isReady[roomState.hostId] = false;
+                io.emit('host-override-notice', `👑 ホスト権限が移動しました。`);
             }
         }
         io.emit('room-update', roomState);
