@@ -299,7 +299,13 @@ io.on('connection', (socket) => {
             });
             
             // リアルタイムにホスト画面等へログを同期したい場合はここでemit
-            io.emit('room-update', roomState);
+            const safeRoomState = {
+                ...roomState,
+                textTimer: null,
+                answerTimer: null,
+                thinkingTimer: null
+            };
+            io.emit('room-update', safeRoomState);
         }
     });
     
