@@ -25,11 +25,10 @@ let roomState = {
     gameWrongCounts: {}, 
     isDisqualified: {},
     isGameOverPending: false,
-
-    // ★新規：早押し同時押し計測用テンポラリデータ
     buzzWindowOpen: false,
     firstBuzzTime: 0,
-    roundBuzzLog: [] // 1問の中で誰が何ミリ秒に押したかの全記録
+    buzzSessionIndex: 0,
+    roundBuzzLog: []
 };
 
 function checkAnswer(userAns, correctAnswers) {
@@ -199,6 +198,7 @@ io.on('connection', (socket) => {
         // 早押し計測初期化
         roomState.buzzWindowOpen = false;
         roomState.firstBuzzTime = 0;
+        roomState.buzzSessionIndex = 0;
         roomState.roundBuzzLog = [];
 
         io.emit('quiz-start', { index: roomState.currentQuizIndex });
@@ -231,16 +231,24 @@ io.on('connection', (socket) => {
         }, 1000);
     }
 
-    // ★修正・拡張：早押しボタン（1秒以内の同時押しラグ計測ロジック）
     socket.on('buzz', () => {
         if (roomState.status !== 'QUIZ_TEXT' && !roomState.buzzWindowOpen) return;
         if (roomState.isDisqualified[socket.id]) return;
         if ((roomState.wrongCountsInRound[socket.id] || 0) >= roomState.config.wrongLimit) return;
 
         const now = Date.now();
+        const currentSession = roomState.buzzSessionIndex;
 
-        // 1人目のBUZZ
-        if (!roomState.buzzWindowOpen) {
+        // 現在のセッション（仕切り直しターン）で、すでに自分がBUZZしていないかチェック
+        // ※ 過去のセッションで押していた場合は、新しいセッションならもう一度押せる
+        const alreadyBuzzedInSession = roomState.roundBuzzLog.some(b => b.id === socket.id && b.session === currentSession);
+        if (alreadyBuzzedInSession) return;
+
+        // 現在のセッションにおいて「1人目のBUZZ」かどうかを判定
+        const isFirstInSession = !roomState.roundBuzzLog.some(b => b.session === currentSession);
+
+        if (isFirstInSession) {
+            // 【現在のセッションでの1人目】
             roomState.buzzWindowOpen = true;
             roomState.firstBuzzTime = now;
             roomState.status = 'QUIZ_ANSWER';
@@ -249,14 +257,21 @@ io.on('connection', (socket) => {
             clearInterval(roomState.textTimer);
             clearInterval(roomState.thinkingTimer);
 
-            roomState.roundBuzzLog.push({ id: socket.id, name: roomState.players[socket.id].name, delay: 0 });
+            // セッション情報(session)と、何回目かのBUZZ順(order)を記録
+            roomState.roundBuzzLog.push({ 
+                id: socket.id, 
+                name: roomState.players[socket.id].name, 
+                delay: 0,
+                session: currentSession,
+                order: roomState.roundBuzzLog.length + 1
+            });
 
             io.emit('buzzed', { playerId: socket.id, name: roomState.players[socket.id].name });
             io.emit('room-update', roomState);
 
             // 1秒間の同時押し受付ウィンドウを開く
             setTimeout(() => {
-                roomState.buzzWindowOpen = false; // 1秒経ったら受付終了
+                roomState.buzzWindowOpen = false;
                 console.log("早押し同時押し集計結果:", roomState.roundBuzzLog);
             }, 1000);
 
@@ -273,19 +288,21 @@ io.on('connection', (socket) => {
             }, 1000);
 
         } else {
-            // ★1秒以内の2人目以降の同時押しを記録
-            // すでにこのウィンドウ内で記録されてないかチェック
-            if (!roomState.roundBuzzLog.some(b => b.id === socket.id)) {
-                const diffTime = ((now - roomState.firstBuzzTime) / 1000).toFixed(3); // 秒単位（小数点3桁）
-                roomState.roundBuzzLog.push({
-                    id: socket.id,
-                    name: roomState.players[socket.id].name,
-                    delay: parseFloat(diffTime)
-                });
-            }
+            // 【現在のセッションでの2人目以降（1秒以内の同時押し）】
+            const diffTime = ((now - roomState.firstBuzzTime) / 1000).toFixed(3); // セッション1人目からの差分
+            roomState.roundBuzzLog.push({
+                id: socket.id,
+                name: roomState.players[socket.id].name,
+                delay: parseFloat(diffTime),
+                session: currentSession,
+                order: roomState.roundBuzzLog.length + 1
+            });
+            
+            // リアルタイムにホスト画面等へログを同期したい場合はここでemit
+            io.emit('room-update', roomState);
         }
     });
-
+    
     socket.on('submit-answer', (answerText) => {
         if (roomState.status !== 'QUIZ_ANSWER' || socket.id !== roomState.activePlayerId) return;
         clearInterval(roomState.answerTimer);
@@ -325,6 +342,9 @@ io.on('connection', (socket) => {
             if (roomState.config.continueOnWrong && alivePlayers.length > 0) {
                 io.emit('wrong-mid-quiz', { wrongPlayer: pName, answerText });
                 roomState.status = 'QUIZ_TEXT';
+                roomState.buzzWindowOpen = false;
+                roomState.firstBuzzTime = 0;
+                roomState.buzzSessionIndex += 1;
                 io.emit('room-update', roomState);
 
                 const fullQuestionText = quiz.question;
