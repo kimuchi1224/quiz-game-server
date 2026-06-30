@@ -160,7 +160,7 @@ io.on('connection', (socket) => {
                 contents: prompt,
                 config: types.GenerateContentConfig(
                     system_instruction=system_instruction,
-                    temperature=0.2, # ハルシネーションを抑えるため低めに設定
+                    temperature=0.2, // ハルシネーションを抑えるため低めに設定
                 )
             });
             
