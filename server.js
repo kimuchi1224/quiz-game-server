@@ -97,7 +97,7 @@ io.on('connection', (socket) => {
             return;
         }
 
-        io.emit('generating-quizzes', "🤖 Gemini AIが特別クイズセットを編集中...");
+        io.emit('generating-quizzes', "🤖 AIがクイズを生成しています...");
 
         try {
             // ★新規：通常モードと画像モードでプロンプトを切り替え
@@ -158,8 +158,12 @@ io.on('connection', (socket) => {
             const response = await ai.models.generateContent({
                 model: 'gemini-2.5-flash',
                 contents: prompt,
+                config: types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    temperature=0.2, # ハルシネーションを抑えるため低めに設定
+                )
             });
-
+            
             let rawText = response.text.trim();
             if (rawText.startsWith("```")) {
                 rawText = rawText.replace(/^```json/, "").replace(/^```/, "").replace(/```$/, "").trim();
